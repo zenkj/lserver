@@ -14,6 +14,7 @@
 #define LS_ERRCODE_TIMEOUT -3
 #define LS_ERRCODE_ADDRESS_USED -4
 #define LS_ERRCODE_ARGSIZE -5
+#define LS_ERRCODE_INTERRUPT -6
 
 
 #define containerof(data, type, member) ((type*)((unsigned char*)data - offsetof(type, member)))
