@@ -18,3 +18,9 @@ lua_State *ls_default_state()
 
     return default_lua_state;
 }
+
+int main(int argc, char *argv[])
+{
+    
+    return 0;
+}
