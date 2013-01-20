@@ -1,7 +1,7 @@
 ls_srcs = $(shell find src -name "*.c")
 ls_objs = $(ls_srcs:.c=.o)
 ls_cflags = -Isrc -Ilib/lua-5.2.1/src -Ilib/libuv-node-v0.9.7/include
-ls_ldflags = -lpthread -lrt -lm
+ls_ldflags = -lpthread -lrt -lm -ldl
 
 liblua = lib/lua-5.2.1/src/liblua.a
 libuv =  lib/libuv-node-v0.9.7/libuv.a
@@ -28,4 +28,7 @@ $(libuv):
 clean:
 	$(MAKE) -C lib/lua-5.2.1/src clean
 	$(MAKE) -C lib/libuv-node-v0.9.7 clean
-	rm -f $(ls_objs) lserver
+	rm -f $(ls_objs) lserver tags
+
+tags:
+	find . -name "*.h" -o -name "*.c" | xargs ctags

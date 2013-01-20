@@ -37,4 +37,10 @@ int        ls_ref_value(lua_State *l, int value);
 int        ls_ref(lua_State *l);
 void       ls_unref(lua_State *l, int ref);
 
+/* libraries */
+
+LUAMOD_API int luaopen_mthread(lua_State *l);
+LUAMOD_API int luaopen_tcp(lua_State *l);
+
+
 #endif //_LSERVER_H_

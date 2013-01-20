@@ -71,12 +71,14 @@ void ls_create_metatable(lua_State *l, const char *name, const luaL_Reg *lib)
 }
 
 /* TODO is it better to create a ls_mthread_ref_queue_t type?
-   this type will include mthread_ref0
+ * this type will include mthread_ref0
+ * TODO this method is not efficient, should improve.
  */
 void ls_make_current_mthread_waiting(lua_State *l, ngx_queue_t *mthread_queue, ls_mthread_ref_t *mthref, int timeout)
 {
     if (mthread_queue)
     {
+        /* TODO is this suitable?? */
         if (!ngx_queue_empty(mthread_queue))
             mthref = NULL;
         mthref = ls_mthread_enqueue(l, mthread_queue, mthref);
@@ -85,6 +87,14 @@ void ls_make_current_mthread_waiting(lua_State *l, ngx_queue_t *mthread_queue, l
     if (timeout >= 0)
     {
         ls_timer_start(l, timeout, mthref);
+    }
+
+    if (mthref)
+    {
+        /* make sure thread is refed even when mthread_queue
+         * is null, and no timer is set
+         */
+        ls_mthread_ref(l, mthref);
     }
 }
 

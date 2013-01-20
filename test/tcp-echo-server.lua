@@ -28,8 +28,8 @@ local function main()
             logger:log('server accept error: ' .. err.msg)
             break
         end
-        local mthread = microthread.create(clientfunc, client)
-        mthread:start()
+        local mth = mthread.create(clientfunc, client)
+        mth:start()
     end
 end
 
