@@ -31,6 +31,7 @@ int main(int argc, char *argv[])
 {
 
     lua_State *l;
+    int result = 0;
 
     l = ls_default_state();
 
@@ -38,13 +39,35 @@ int main(int argc, char *argv[])
 
     ls_openlibs(l);
 
-    if (argc == 2)
+    if (argc != 2)
     {
-        luaL_loadfile(l, argv[1]);
-        lua_resume(l, NULL, 0);
+        fprintf(stderr, "a lua file should specified\n");
+        return -1;
     }
 
-    uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+    result = luaL_loadfile(l, argv[1]);
+    if (result != LUA_OK)
+    {
+        const char *msg = lua_tostring(l, -1);
+        fprintf(stderr, "load lua file %s error: %s\n", argv[1], msg);
+        return -1;
+    }
+
+    result = ls_resume(l, 0);
+    while (result == LUA_YIELD)
+    {
+        result = uv_run(uv_default_loop(), UV_RUN_ONCE);
+        if (result == 0)
+            break;
+        result = lua_status(l);
+    }
+
+    if (result != LUA_OK)
+    {
+        const char *msg = lua_tostring(l, -1);
+        fprintf(stderr, "execute lua file %s error: %s\n", argv[1], msg);
+        return -1;
+    }
     
-    return 0;
+    return result;
 }

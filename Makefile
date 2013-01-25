@@ -25,10 +25,20 @@ $(liblua):
 $(libuv):
 	$(MAKE) -C lib/libuv-node-v0.9.7
 
+ts:
+	./lserver test/simple-server.lua
+
+tc:
+	./lserver test/simple-client.lua
+
+d:
+	gdb lserver
+
+tag:
+	find . -name "*.h" -o -name "*.c" | xargs ctags
+
 clean:
 	$(MAKE) -C lib/lua-5.2.1/src clean
 	$(MAKE) -C lib/libuv-node-v0.9.7 clean
 	rm -f $(ls_objs) lserver tags
 
-tags:
-	find . -name "*.h" -o -name "*.c" | xargs ctags

@@ -25,6 +25,7 @@
 lua_State *ls_default_state();
 void      *ls_malloc(lua_State *l, size_t size);
 void       ls_free(lua_State *l, void *data);
+int        ls_resume(lua_State *l, int nargs);
 void       ls_error_resume(lua_State *l, int code, const char *msg);
 void       ls_last_error_resume(lua_State *l, uv_loop_t *loop);
 void       ls_ok_resume(lua_State *l);

@@ -15,6 +15,16 @@ void ls_free(lua_State *l, void *data)
     free(data);
 }
 
+int ls_resume(lua_State *l, int nargs)
+{
+    int result = lua_resume(l, NULL, nargs);
+    if (result != LUA_OK && result != LUA_YIELD)
+    {
+        luaL_error(l, lua_tostring(l, -1));
+    }
+    return result;
+}
+
 void ls_error_resume(lua_State *l, int code, const char *msg)
 {
     lua_pushboolean(l, 0);
@@ -23,7 +33,7 @@ void ls_error_resume(lua_State *l, int code, const char *msg)
     lua_setfield(l, -2, "code");
     lua_pushstring(l, msg);
     lua_setfield(l, -2, "msg");
-    lua_resume(l, NULL, 2);
+    ls_resume(l, 2);
 }
 
 void ls_last_error_resume(lua_State *l, uv_loop_t *loop)
@@ -35,7 +45,7 @@ void ls_last_error_resume(lua_State *l, uv_loop_t *loop)
 void ls_ok_resume(lua_State *l)
 {
     lua_pushboolean(l, 1);
-    lua_resume(l, NULL, 1);
+    ls_resume(l, 1);
 }
 
 int ls_error_return(lua_State *l, int code, const char *msg)

@@ -73,9 +73,9 @@ static void tcp_close_cb(uv_handle_t *handle)
         if (LUA_YIELD == lua_status(nl))
         {
             ls_error_resume(nl, LS_ERRCODE_EOF, "tcp closed");
+            if (nl != l) lua_pop(l, 1);
         }
-        // pop the thread after resume, to ensure the thread is not released by GC.
-        lua_pop(l, 1);
+        else lua_pop(l, 1);
     }
 
     ls_free(l, handle);
@@ -131,14 +131,17 @@ static void tcp_read_cb(uv_stream_t *handle, ssize_t nread, uv_buf_t buf)
             continue;
 
         if (nread == -1)
+            ls_last_error_resume(nl, loop);
+        else
         {
-            uv_err_t err = uv_last_error(loop);
-            ls_error_resume(nl, err.code, uv_strerror(err));
-            return;
+            lua_pushboolean(nl, 1);
+            lua_pushlstring(nl, buf.base, nread);
+            ls_resume(nl, 2);
         }
-        lua_pushboolean(nl, 1);
-        lua_pushlstring(nl, buf.base, nread);
-        lua_resume(nl, NULL, 2);
+
+        // pop the thread after resume, to ensure the thread is not released by GC.
+        if (nl != l)
+            lua_pop(l, 1);
         return;
     }
 }
@@ -158,8 +161,12 @@ static void tcp_listen_cb(uv_stream_t *handle, int status)
             int errcode = uv_last_error(loop).code;
             const char *errmsg = uv_strerror(uv_last_error(loop));
             if (LUA_YIELD == lua_status(nl))
+            {
                 ls_error_resume(nl, errcode, errmsg);
-            lua_pop(l, 1);
+                if (nl != l) lua_pop(l, 1);
+            }
+            else
+                lua_pop(l, 1);
         }
         return;
     }
@@ -186,12 +193,14 @@ static void tcp_listen_cb(uv_stream_t *handle, int status)
             {
                 lua_pushboolean(nl, 1);
                 new_tcp_connection_udata(nl, client);
-                lua_resume(nl, NULL, 2);
-                lua_pop(l, 1);
+                ls_resume(nl, 2);
+                if (nl != l) lua_pop(l, 1);
                 return;
             }
             else
+            {
                 lua_pop(l, 1);
+            }
         }
 
         // the client has no mthread to handle it, free it
@@ -212,7 +221,7 @@ static int tcp_create_server(lua_State *l)
     {
         ip4 = luaL_checkstring(l, 1);
         port = luaL_checkint(l, 2);
-        luaL_argcheck(l, strlen(ip4) > 0, 1, "invalid ipv4 address");
+        luaL_argcheck(l, strnlen(ip4, 256) > 0, 1, "invalid ipv4 address");
         luaL_argcheck(l, port >= 0, 2, "port number should >= 0");
     }
     else if (lua_gettop(l) == 1)
@@ -225,13 +234,13 @@ static int tcp_create_server(lua_State *l)
 
     if (uv_tcp_bind(handle, uv_ip4_addr(ip4, port)))
     {
-        ls_free(l, server);
+        uv_close((uv_handle_t*)server, tcp_close_cb);
         return ls_error_return(l, LS_ERRCODE_ADDRESS_USED, "bind failed: address used.");
     }
 
     if (uv_listen((uv_stream_t*)handle, 128, tcp_listen_cb))
     {
-        ls_free(l, server);
+        uv_close((uv_handle_t*)server, tcp_close_cb);
         return ls_error_return(l, LS_ERRCODE_ERROR, "listen failed.");
     }
 
@@ -240,10 +249,85 @@ static int tcp_create_server(lua_State *l)
     return 2;
 }
 
+static void tcp_connect_cb(uv_connect_t *connect_req, int status)
+{
+    ls_tcp_t *client = (ls_tcp_t*)connect_req->handle;
+    uv_tcp_t *handle = &client->handle;
+    lua_State *l = ls_default_state();
+    lua_State *nl;
+    uv_loop_t *loop = uv_default_loop();
+
+    ls_free(l, connect_req);
+
+    nl = ls_mthread_unref(l, &client->mthread_ref0);
+    if (nl)
+    {
+        ls_timer_stop(nl, 1);
+        if (status)
+        {
+            uv_close((uv_handle_t*)handle, tcp_close_cb);
+            ls_last_error_resume(nl, loop);
+        }
+        else
+        {
+            if (uv_read_start((uv_stream_t*)handle, tcp_alloc_cb, tcp_read_cb))
+            {
+                uv_close((uv_handle_t*)handle, tcp_close_cb);
+                ls_last_error_resume(nl, loop);
+                return;
+            }
+            lua_pushboolean(nl, 1);
+            new_tcp_connection_udata(nl, client);
+            ls_resume(nl, 2);
+        }
+
+        if (nl != l)
+            lua_pop(l, 1);
+    }
+}
+
 static int tcp_create_client(lua_State *l)
 {
-    return 1;
+    const char    *rip4     = "0.0.0.0";
+    int            rport    = 0;
+    ls_tcp_t      *client;
+    uv_tcp_t      *handle;
+    uv_loop_t     *loop    = uv_default_loop();
+    uv_connect_t  *connect_req;
+    int            connect_timeout;
 
+    if (lua_gettop(l) >= 2)
+    {
+        rip4 = luaL_checkstring(l, 1);
+        rport = luaL_checkint(l, 2);
+        luaL_argcheck(l, strnlen(rip4, 256) > 0, 1, "invalid ipv4 address");
+        luaL_argcheck(l, rport > 0, 2, "port number should > 0");
+    }
+    else if (lua_gettop(l) == 1)
+    {
+        rport = luaL_checkint(l, 1);
+        luaL_argcheck(l, rport > 0, 1, "port number should > 0");
+    }
+    else
+        return ls_error_return(l, LS_ERRCODE_INVAL, "server ip and port should be specified.");
+    client = new_tcp_handle(l);
+    handle = &client->handle;
+    connect_req = (uv_connect_t*)ls_malloc(l, sizeof(uv_connect_t));
+    if (uv_tcp_connect(connect_req, &client->handle, uv_ip4_addr(rip4, rport), tcp_connect_cb))
+    {
+        ls_free(l, connect_req);
+        uv_close((uv_handle_t*)client, tcp_close_cb);
+        return ls_last_error_return(l, loop);
+    }
+
+    lua_getglobal(l, "tcp");
+    lua_getfield(l, -1, "connect_timeout");
+    connect_timeout = lua_tointeger(l, -1);
+    lua_pop(l, 2);
+
+    ls_make_current_mthread_waiting(l, NULL, &client->mthread_ref0, connect_timeout);
+
+    return lua_yield(l, 0);
 }
 
 static int tcp_server_accept(lua_State *l)
@@ -322,7 +406,7 @@ static int tcp_server_get_localport(lua_State *l)
     }
     
     lua_pushboolean(l, 1);
-    lua_pushinteger(l, sin->sin_port);
+    lua_pushinteger(l, ntohs(sin->sin_port));
     return 2;
 }
 
@@ -344,7 +428,7 @@ static int tcp_server_tostring(lua_State *l)
         lua_pushliteral(l, "tcp server (closed)");
     else if (!uv_tcp_getsockname(&handle->handle, &sockname, &namelen) &&
              !uv_ip4_name(sin, ip, sizeof ip))
-        lua_pushfstring(l, "tcp server (%s:%d)", ip, sin->sin_port);
+        lua_pushfstring(l, "tcp server (%s:%d)", ip, ntohs(sin->sin_port));
     else
         lua_pushliteral(l, "tcp server (invalid)");
     
@@ -374,19 +458,22 @@ static void tcp_write_cb(uv_write_t *req, int status)
     for (i=0; i<write_req->refcnt; i++)
     {
         ls_unref(l, write_req->data_refs[i]);
+        lua_pop(l, 1);
         write_req->data_refs[i] = LUA_NOREF;
     }
     write_req->refcnt = 0;
 
-    nl = ls_mthread_unref(ls_default_state(), &write_req->mthread_ref0);
-    ls_timer_stop(nl, 1);
+    nl = ls_mthread_unref(l, &write_req->mthread_ref0);
 
     if (nl)
     {
+        ls_timer_stop(nl, 1);
         if (status)
-            ls_last_error_resume(l, req->handle->loop);
+            ls_last_error_resume(nl, req->handle->loop);
         else
-            ls_ok_resume(l);
+            ls_ok_resume(nl);
+        if (nl != l)
+            lua_pop(l, 1);
     }
     ls_free(l, write_req);
 }
@@ -571,7 +658,7 @@ static int tcp_get_localport(lua_State *l)
     }
     
     lua_pushboolean(l, 1);
-    lua_pushinteger(l, sin->sin_port);
+    lua_pushinteger(l, ntohs(sin->sin_port));
     return 2;
 }
 
@@ -619,7 +706,7 @@ static int tcp_get_peerport(lua_State *l)
     }
     
     lua_pushboolean(l, 1);
-    lua_pushinteger(l, sin->sin_port);
+    lua_pushinteger(l, ntohs(sin->sin_port));
     return 2;
 }
 
@@ -645,7 +732,7 @@ static int tcp_tostring(lua_State *l)
              !uv_ip4_name(lsin, lip, sizeof lip) &&
              !uv_tcp_getpeername(&handle->handle, &rsockname, &rnamelen) &&
              !uv_ip4_name(rsin, rip, sizeof rip))
-        lua_pushfstring(l, "tcp connection (local: %s:%d, remote: %s:%d)", lip, lsin->sin_port, rip, rsin->sin_port);
+        lua_pushfstring(l, "tcp connection (local: %s:%d, remote: %s:%d)", lip, ntohs(lsin->sin_port), rip, ntohs(rsin->sin_port));
     else
         lua_pushliteral(l, "tcp connection (invalid)");
     
@@ -688,6 +775,8 @@ static const luaL_Reg tcp_connection_lib[] = {
 LUAMOD_API int luaopen_tcp(lua_State *l)
 {
     luaL_newlib(l, tcp_lib);
+    lua_pushinteger(l, 30*1000);
+    lua_setfield(l, -2, "connect_timeout");
 
     ls_create_metatable(l, TCP_SERVER, tcp_server_lib);
     ls_create_metatable(l, TCP_CONNECTION, tcp_connection_lib);
