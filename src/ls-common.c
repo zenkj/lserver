@@ -1,6 +1,7 @@
 #include "lserver.h"
 
 #include <stdlib.h>
+#include <assert.h>
 
 void *ls_malloc(lua_State *l, size_t size)
 {
@@ -12,6 +13,7 @@ void *ls_malloc(lua_State *l, size_t size)
 
 void ls_free(lua_State *l, void *data)
 {
+    (void)l;
     free(data);
 }
 
@@ -25,7 +27,7 @@ int ls_resume(lua_State *l, int nargs)
     return result;
 }
 
-void ls_error_resume(lua_State *l, int code, const char *msg)
+int ls_error_resume(lua_State *l, int code, const char *msg)
 {
     lua_pushboolean(l, 0);
     lua_newtable(l);
@@ -33,19 +35,19 @@ void ls_error_resume(lua_State *l, int code, const char *msg)
     lua_setfield(l, -2, "code");
     lua_pushstring(l, msg);
     lua_setfield(l, -2, "msg");
-    ls_resume(l, 2);
+    return ls_resume(l, 2);
 }
 
-void ls_last_error_resume(lua_State *l, uv_loop_t *loop)
+int ls_last_error_resume(lua_State *l, uv_loop_t *loop)
 {
     uv_err_t err = uv_last_error(loop);
-    ls_error_resume(l, err.code, uv_strerror(err));
+    return ls_error_resume(l, err.code, uv_strerror(err));
 }
 
-void ls_ok_resume(lua_State *l)
+int ls_ok_resume(lua_State *l)
 {
     lua_pushboolean(l, 1);
-    ls_resume(l, 1);
+    return ls_resume(l, 1);
 }
 
 int ls_error_return(lua_State *l, int code, const char *msg)
@@ -80,32 +82,35 @@ void ls_create_metatable(lua_State *l, const char *name, const luaL_Reg *lib)
     lua_pop(l, 1);
 }
 
-/* TODO is it better to create a ls_mthread_ref_queue_t type?
- * this type will include mthread_ref0
- * TODO this method is not efficient, should improve.
- */
-void ls_make_current_mthread_waiting(lua_State *l, ngx_queue_t *mthread_queue, ls_mthread_ref_t *mthref, int timeout)
+void ls_set_waiting(lua_State *l, ls_wait_object_t *wait_object, int timeout)
 {
-    if (mthread_queue)
+    ls_state_extra_t *extra = state2extra(l);
+    assert(extra->wait_object == NULL);
+    assert(!ls_object_is_waited(&extra->timer->wait_object));
+    if (wait_object)
     {
-        /* TODO is this suitable?? */
-        if (!ngx_queue_empty(mthread_queue))
-            mthref = NULL;
-        mthref = ls_mthread_enqueue(l, mthread_queue, mthref);
+        lua_pushthread(l);
+        wait_object->mthread_ref = ls_ref(l);
+        extra->wait_object = wait_object;
     }
 
     if (timeout >= 0)
     {
-        ls_timer_start(l, timeout, mthref);
+        ls_timer_start(l, timeout);
+    }
+}
+
+void ls_clear_waiting(lua_State *l)
+{
+    ls_state_extra_t *extra = state2extra(l);
+    if (extra->wait_object)
+    {
+        ls_unref(l, extra->wait_object->mthread_ref);
+        extra->wait_object->mthread_ref = LUA_NOREF;
+        extra->wait_object = NULL;
     }
 
-    if (mthref)
-    {
-        /* make sure thread is refed even when mthread_queue
-         * is null, and no timer is set
-         */
-        ls_mthread_ref(l, mthref);
-    }
+    ls_timer_stop(l);
 }
 
 int ls_ref_value(lua_State *l, int value)
@@ -119,9 +124,27 @@ int ls_ref(lua_State *l)
     return luaL_ref(l, LUA_REGISTRYINDEX);
 }
 
-void ls_unref(lua_State *l, int ref)
+void ls_getref(lua_State *l, int ref)
 {
     lua_rawgeti(l, LUA_REGISTRYINDEX, ref);
+}
+
+void ls_unref(lua_State *l, int ref)
+{
     luaL_unref(l, LUA_REGISTRYINDEX, ref);
+}
+
+void ls_wait_object_init(ls_wait_object_t *wait_object)
+{
+    wait_object->mthread_ref = LUA_NOREF;
+}
+
+int ls_object_is_waited(ls_wait_object_t *wait_object)
+{
+    if (wait_object == NULL)
+        return 0;
+    if (wait_object->mthread_ref >= 0)
+        return 1;
+    return 0;
 }
 

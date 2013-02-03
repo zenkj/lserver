@@ -5,7 +5,7 @@ static int mthread_sleep(lua_State *l)
     int timeout = luaL_checkint(l, 1);
     luaL_argcheck(l, timeout >= 0, 1, "sleep time should >= 0");
 
-    ls_timer_start(l, timeout, NULL);
+    ls_timer_start(l, timeout);
 
     return lua_yield(l, 0);
 }
@@ -17,7 +17,7 @@ static int mthread_wakeup(lua_State *l)
 
     if (LUA_YIELD == lua_status(nl))
     {
-        ls_timer_stop(nl, 0);
+        ls_timer_stop(nl);
         ls_error_resume(nl, LS_ERRCODE_INTERRUPT, "wake up by others");
     }
     return 0;

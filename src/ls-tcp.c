@@ -1,5 +1,6 @@
 #include "lserver.h"
 #include <string.h>
+#include <assert.h>
 
 #define TCP_SERVER         "ls_tcp_server"
 #define TCP_CONNECTION     "ls_tcp_connection"
@@ -7,8 +8,8 @@
 #define MAX_WRITE_BUF_COUNT 16
 typedef struct ls_write_s
 {
+    ls_wait_object_t wait_object;
     uv_write_t       req;
-    ls_mthread_ref_t mthread_ref0;
     int              data_refs[MAX_WRITE_BUF_COUNT];
     int              refcnt;
 } ls_write_t;
@@ -19,7 +20,7 @@ static ls_write_t *new_write_req(lua_State *l)
     ls_write_t   *wr;
 
     wr = (ls_write_t*)ls_malloc(l, sizeof(ls_write_t));
-    ls_mthread_ref_init(&wr->mthread_ref0, 0);
+    wr->wait_object.mthread_ref = LUA_NOREF;
     for (i=0; i<arraysize(wr->data_refs); i++)
         wr->data_refs[i] = LUA_NOREF;
     wr->refcnt = 0;
@@ -30,9 +31,9 @@ static ls_write_t *new_write_req(lua_State *l)
 /* object in C */
 typedef struct ls_tcp_s
 {
+    ls_wait_object_t wait_object;
     uv_tcp_t         handle;
-    ls_mthread_ref_t mthread_ref0;
-    ngx_queue_t      mthread_queue;
+    uv_read_cb       read_cb;
 } ls_tcp_t;
 
 /* object seen in lua */
@@ -45,15 +46,14 @@ typedef struct tcp_udata_s
 #define server_udata(l)     ((tcp_udata_t*)luaL_checkudata(l, 1, TCP_SERVER))
 #define connection_udata(l) ((tcp_udata_t*)luaL_checkudata(l, 1, TCP_CONNECTION))
 
+static void tcp_read_cb(uv_stream_t *handle, ssize_t nread, uv_buf_t buf);
 static ls_tcp_t *new_tcp_handle(lua_State *l)
 {
     ls_tcp_t *tcp = (ls_tcp_t*)ls_malloc(l, sizeof(ls_tcp_t));
 
+    ls_wait_object_init(&tcp->wait_object);
     uv_tcp_init(uv_default_loop(), &tcp->handle);
-
-    ls_mthread_ref_init(&tcp->mthread_ref0, 0);
-
-    ngx_queue_init(&tcp->mthread_queue);
+    tcp->read_cb = tcp_read_cb;
 
     return tcp;
 }
@@ -62,23 +62,27 @@ static void tcp_close_cb(uv_handle_t *handle)
 {
     ls_tcp_t    *tcp;
     lua_State   *l, *nl;
-    ngx_queue_t *mthread_queue;
 
-    tcp           = (ls_tcp_t*) handle;
+    tcp           = containerof(handle, ls_tcp_t, handle);
     l             = ls_default_state();
-    mthread_queue = &tcp->mthread_queue;
 
-    while (nl = ls_mthread_dequeue(l, mthread_queue))
+    if (ls_object_is_waited(&tcp->wait_object))
     {
-        if (LUA_YIELD == lua_status(nl))
+        int ref = tcp->wait_object.mthread_ref;
+        tcp->wait_object.mthread_ref = LUA_NOREF; 
+        ls_getref(l, ref);
+        nl = lua_tothread(l, -1);
+        lua_pop(l, 1);
+        if (nl)
         {
-            ls_error_resume(nl, LS_ERRCODE_EOF, "tcp closed");
-            if (nl != l) lua_pop(l, 1);
+            ls_clear_waiting(nl);
+            if (LUA_YIELD == lua_status(nl))
+                ls_error_resume(nl, LS_ERRCODE_EOF, "tcp closed");
         }
-        else lua_pop(l, 1);
+        ls_unref(l, ref);
     }
 
-    ls_free(l, handle);
+    ls_free(l, tcp);
 }
 
 static tcp_udata_t *_new_tcp_udata(lua_State *l, ls_tcp_t *handle)
@@ -117,94 +121,84 @@ static void tcp_read_cb(uv_stream_t *handle, ssize_t nread, uv_buf_t buf)
 {
     uv_loop_t *loop = uv_default_loop();
     lua_State *l    = ls_default_state();
-    ls_tcp_t  *tcp  = (ls_tcp_t*)handle;
+    ls_tcp_t  *tcp  = containerof(handle, ls_tcp_t, handle);
     lua_State *nl;
 
-    if (ngx_queue_empty(&tcp->mthread_queue))
-        return;
-
-    while (nl = ls_mthread_dequeue(l, &tcp->mthread_queue))
+    if (ls_object_is_waited(&tcp->wait_object))
     {
-        ls_timer_stop(nl, 1);
-
-        if (LUA_YIELD != lua_status(nl))
-            continue;
-
-        if (nread == -1)
-            ls_last_error_resume(nl, loop);
-        else
+        int ref = tcp->wait_object.mthread_ref;
+        ls_getref(l, ref);
+        tcp->wait_object.mthread_ref = LUA_NOREF;
+        nl = lua_tothread(l, -1);
+        lua_pop(l, 1);
+        if (nl)
         {
-            lua_pushboolean(nl, 1);
-            lua_pushlstring(nl, buf.base, nread);
-            ls_resume(nl, 2);
+            ls_clear_waiting(nl);
+            if (LUA_YIELD == lua_status(nl))
+            {
+                if (nread == -1)
+                    ls_last_error_resume(nl, loop);
+                else
+                {
+                    lua_pushboolean(nl, 1);
+                    lua_pushlstring(nl, buf.base, nread);
+                    ls_resume(nl, 2);
+                }
+            }
         }
-
-        // pop the thread after resume, to ensure the thread is not released by GC.
-        if (nl != l)
-            lua_pop(l, 1);
-        return;
+        ls_unref(l, ref);
     }
 }
 
 static void tcp_listen_cb(uv_stream_t *handle, int status)
 {
     lua_State   *l             = ls_default_state();
-    ls_tcp_t    *server        = (ls_tcp_t *)handle;
+    ls_tcp_t    *server        = containerof(handle, ls_tcp_t, handle);
     uv_loop_t   *loop          = uv_default_loop();
-    ngx_queue_t *mthread_queue = &server->mthread_queue;
     lua_State   *nl;
 
-    if (status != 0)
+    if (ls_object_is_waited(&server->wait_object))
     {
-        while (nl = ls_mthread_dequeue(l, mthread_queue))
+        int ref = server->wait_object.mthread_ref;
+        server->wait_object.mthread_ref = LUA_NOREF;
+        ls_getref(l, ref);
+        nl = lua_tothread(l, -1);
+        lua_pop(l, 1);
+
+        if (nl)
         {
-            int errcode = uv_last_error(loop).code;
-            const char *errmsg = uv_strerror(uv_last_error(loop));
-            if (LUA_YIELD == lua_status(nl))
+            ls_clear_waiting(nl);
+            if (status != 0)
             {
-                ls_error_resume(nl, errcode, errmsg);
-                if (nl != l) lua_pop(l, 1);
-            }
-            else
-                lua_pop(l, 1);
-        }
-        return;
-    }
-
-    if (!ngx_queue_empty(mthread_queue))
-    {
-        ls_tcp_t *client = new_tcp_handle(l);
-
-        if (uv_accept(handle, (uv_stream_t*)&client->handle))
-        {
-            ls_free(l, client);
-            luaL_error(l, "accept failed");
-        }
-
-        if (uv_read_start((uv_stream_t*)&client->handle, tcp_alloc_cb, tcp_read_cb))
-        {
-            ls_free(l, client);
-            luaL_error(l, "start read failed");
-        }
-
-        while (nl = ls_mthread_dequeue(l, mthread_queue))
-        {
-            if (lua_status(nl) == LUA_YIELD)
-            {
-                lua_pushboolean(nl, 1);
-                new_tcp_connection_udata(nl, client);
-                ls_resume(nl, 2);
-                if (nl != l) lua_pop(l, 1);
-                return;
+                ls_last_error_resume(nl, loop);
             }
             else
             {
-                lua_pop(l, 1);
+                ls_tcp_t *client = new_tcp_handle(l);
+                if (uv_accept(handle, (uv_stream_t*)&client->handle))
+                {
+                    ls_free(nl, client);
+                    luaL_error(nl, "accept failed");
+                }
+                if (uv_read_start((uv_stream_t*)&client->handle, tcp_alloc_cb, client->read_cb))
+                {
+                    ls_free(nl, client);
+                    luaL_error(nl, "start read failed.");
+                }
+
+                if (LUA_YIELD == lua_status(nl))
+                {
+                    lua_pushboolean(nl, 1);
+                    new_tcp_connection_udata(nl, client);
+                    ls_resume(nl, 2);
+                }
+                else
+                {
+                    ls_free(nl, client);
+                }
             }
         }
-
-        // the client has no mthread to handle it, free it
-        ls_free(l, client);
+        ls_unref(l, ref);
     }
 }
 
@@ -251,7 +245,7 @@ static int tcp_create_server(lua_State *l)
 
 static void tcp_connect_cb(uv_connect_t *connect_req, int status)
 {
-    ls_tcp_t *client = (ls_tcp_t*)connect_req->handle;
+    ls_tcp_t *client = containerof(connect_req->handle, ls_tcp_t, handle);
     uv_tcp_t *handle = &client->handle;
     lua_State *l = ls_default_state();
     lua_State *nl;
@@ -259,30 +253,37 @@ static void tcp_connect_cb(uv_connect_t *connect_req, int status)
 
     ls_free(l, connect_req);
 
-    nl = ls_mthread_unref(l, &client->mthread_ref0);
-    if (nl)
+    if (ls_object_is_waited(&client->wait_object))
     {
-        ls_timer_stop(nl, 1);
-        if (status)
+        int ref = client->wait_object.mthread_ref;
+        client->wait_object.mthread_ref = LUA_NOREF;
+        ls_getref(l, ref);
+        nl = lua_tothread(l, -1);
+        lua_pop(l, 1);
+        if (nl)
         {
-            uv_close((uv_handle_t*)handle, tcp_close_cb);
-            ls_last_error_resume(nl, loop);
-        }
-        else
-        {
-            if (uv_read_start((uv_stream_t*)handle, tcp_alloc_cb, tcp_read_cb))
+            ls_clear_waiting(nl);
+            if (status)
             {
                 uv_close((uv_handle_t*)handle, tcp_close_cb);
                 ls_last_error_resume(nl, loop);
-                return;
             }
-            lua_pushboolean(nl, 1);
-            new_tcp_connection_udata(nl, client);
-            ls_resume(nl, 2);
+            else
+            {
+                if (uv_read_start((uv_stream_t*)handle, tcp_alloc_cb, client->read_cb))
+                {
+                    uv_close((uv_handle_t*)handle, tcp_close_cb);
+                    ls_last_error_resume(nl, loop);
+                }
+                else
+                {
+                    lua_pushboolean(nl, 1);
+                    new_tcp_connection_udata(nl, client);
+                    ls_resume(nl, 2);
+                }
+            }
         }
-
-        if (nl != l)
-            lua_pop(l, 1);
+        ls_unref(l, ref);
     }
 }
 
@@ -311,7 +312,6 @@ static int tcp_create_client(lua_State *l)
     else
         return ls_error_return(l, LS_ERRCODE_INVAL, "server ip and port should be specified.");
     client = new_tcp_handle(l);
-    handle = &client->handle;
     connect_req = (uv_connect_t*)ls_malloc(l, sizeof(uv_connect_t));
     if (uv_tcp_connect(connect_req, &client->handle, uv_ip4_addr(rip4, rport), tcp_connect_cb))
     {
@@ -325,7 +325,7 @@ static int tcp_create_client(lua_State *l)
     connect_timeout = lua_tointeger(l, -1);
     lua_pop(l, 2);
 
-    ls_make_current_mthread_waiting(l, NULL, &client->mthread_ref0, connect_timeout);
+    ls_set_waiting(l, &client->wait_object, connect_timeout);
 
     return lua_yield(l, 0);
 }
@@ -339,7 +339,7 @@ static int tcp_server_accept(lua_State *l)
     if (tcp == NULL)
         return ls_error_return(l, LS_ERRCODE_EOF, "tcp server closed");
 
-    ls_make_current_mthread_waiting(l, &tcp->mthread_queue, &tcp->mthread_ref0, udata->timeout);
+    ls_set_waiting(l, &tcp->wait_object, udata->timeout);
 
     return lua_yield(l, 0);
 }
@@ -352,12 +352,12 @@ static int tcp_server_close(lua_State *l)
      */
 
     tcp_udata_t *udata = server_udata(l);
-    uv_handle_t *handle = (uv_handle_t*)udata->handle;
-    if (handle)
+    ls_tcp_t *server = (ls_tcp_t*)udata->handle;
+    if (server)
     {
         udata->handle = NULL;
         udata->timeout = -1;
-        uv_close(handle, tcp_close_cb);
+        uv_close((uv_handle_t*)&server->handle, tcp_close_cb);
     }
     return 0;
 }
@@ -443,14 +443,15 @@ static int tcp_read(lua_State *l)
     if (tcp == NULL)
         return ls_error_return(l, LS_ERRCODE_EOF, "tcp connection closed.");
 
-    ls_make_current_mthread_waiting(l, &tcp->mthread_queue, &tcp->mthread_ref0, udata->timeout);
+    ls_set_waiting(l, &tcp->wait_object, udata->timeout);
 
     return lua_yield(l, 0);
 }
 
 static void tcp_write_cb(uv_write_t *req, int status)
 {
-    ls_write_t *write_req = (ls_write_t*)req;
+    ls_write_t *write_req = containerof(req, ls_write_t, req);
+    uv_loop_t *loop = uv_default_loop();
     lua_State *l, *nl;
     int i;
 
@@ -463,17 +464,27 @@ static void tcp_write_cb(uv_write_t *req, int status)
     }
     write_req->refcnt = 0;
 
-    nl = ls_mthread_unref(l, &write_req->mthread_ref0);
-
-    if (nl)
+    if (ls_object_is_waited(&write_req->wait_object))
     {
-        ls_timer_stop(nl, 1);
-        if (status)
-            ls_last_error_resume(nl, req->handle->loop);
-        else
-            ls_ok_resume(nl);
-        if (nl != l)
-            lua_pop(l, 1);
+        int ref = write_req->wait_object.mthread_ref;
+        write_req->wait_object.mthread_ref = LUA_NOREF;
+        ls_getref(l, ref);
+        nl = lua_tothread(l, -1);
+        lua_pop(l, 1);
+        if (nl)
+        {
+            ls_clear_waiting(nl);
+            if (status)
+            {
+                ls_last_error_resume(nl, req->handle->loop);
+            }
+            else
+            {
+                ls_ok_resume(nl);
+            }
+        }
+
+        ls_unref(l, ref);
     }
     ls_free(l, write_req);
 }
@@ -532,7 +543,7 @@ static int tcp_write(lua_State *l)
 
     // libuv make sure now tcp_write_cb is not called, even the data
     // has been writen already.
-    ls_make_current_mthread_waiting(l, NULL, &write_req->mthread_ref0, udata->timeout);
+    ls_set_waiting(l, &write_req->wait_object, udata->timeout);
 
     return lua_yield(l, 0);
 }
@@ -540,12 +551,12 @@ static int tcp_write(lua_State *l)
 static int tcp_close(lua_State *l)
 {
     tcp_udata_t *udata = connection_udata(l);
-    uv_handle_t *handle = (uv_handle_t*)udata->handle;
+    ls_tcp_t *handle = udata->handle;
     if (handle)
     {
         udata->handle = NULL;
         udata->timeout = -1;
-        uv_close(handle, tcp_close_cb);
+        uv_close((uv_handle_t*)&handle->handle, tcp_close_cb);
     }
     return 0;
 }

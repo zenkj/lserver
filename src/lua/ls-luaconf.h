@@ -1,10 +1,10 @@
 #ifndef ls_luaconf_h
 #define ls_luaconf_h
 
-#include "ls-lstate-extra.h"
+#include "ls-state-extra.h"
 
 /* definition for lua. lua's compilation needs the following */
-#define LUAI_EXTRASPACE (sizeof(ls_thread_extra_t))
+#define LUAI_EXTRASPACE (sizeof(ls_state_extra_t))
 
 #define luai_userstateopen(l)          userstate_init(l)
 #define luai_userstateclose(l)         userstate_clean(l)

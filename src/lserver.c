@@ -58,7 +58,11 @@ int main(int argc, char *argv[])
     {
         result = uv_run(uv_default_loop(), UV_RUN_ONCE);
         if (result == 0)
+        {
+            /* LUA_OK is 0 occisionally, but do not rely on this */
+            result = LUA_OK;
             break;
+        }
         result = lua_status(l);
     }
 
