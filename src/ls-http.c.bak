@@ -1,0 +1,316 @@
+#include "lserver.h"
+#include <string.h>
+#include "http_parser.h"
+#include "ls-tcp.h"
+
+#define HTTP_SERVER         "ls_http_server"
+#define HTTP_CONNECTION     "ls_http_connection"
+
+
+/* object in C */
+typedef struct ls_http_s
+{
+    ls_tcp_t         tcp;
+    http_parser      httpparser;
+    char             buf[8*1024];
+    char            *bufpos;
+    char            *url;
+    char            *header_key;
+    char            *header_value;
+    int              dataref;
+    
+} ls_http_t;
+
+/* object seen in lua */
+typedef struct http_udata_s
+{
+    ls_http_t     *handle;
+    int           timeout;
+} tcp_udata_t;
+
+#define server_udata(l)     ((tcp_udata_t*)luaL_checkudata(l, 1, TCP_SERVER))
+#define connection_udata(l) ((tcp_udata_t*)luaL_checkudata(l, 1, TCP_CONNECTION))
+
+static int on_message_begin(http_parser *parser)
+{
+    lua_State *l = ls_default_state();
+    ls_http_t *tcp = containerof(parser, ls_http_t, httpparser);
+    tcp->bufpos = tcp->buf;
+    tcp->url = NULL;
+    tcp->header_key = NULL;
+    tcp->header_value = NULL;
+    
+    lua_newtable(l);
+    tcp->dataref = ls_ref(l);
+
+    return 0;
+}
+
+static int on_url(http_parser *parser, const char *data, size_t len)
+{
+    lua_State *l = ls_default_state();
+    ls_http_t *tcp = containerof(parser, ls_http_t, httpparser);
+    
+    if (tcp->url == NULL)
+    {
+        tcp->url = tcp->buf;
+        tcp->bufpos = tcp->buf;
+    }
+
+    if (tcp->bufpos + len - tcp->buf >= arraysize(tcp->buf))
+    {
+        luaL_error(l, "too long url");
+    }
+
+    memcpy(tcp->bufpos, data, len);
+    tcp->bufpos += len;
+    
+    return 0;
+}
+
+static void collect_url(lua_State *l, ls_tcp_t *tcp)
+{
+    ls_getref(l, tcp->dataref);
+    lua_pushlstring(l, tcp->url, tcp->bufpos - tcp->url);
+    lua_setfield(l, -2, "url");
+    lua_pop(l, 1);
+    tcp->url = NULL;
+    tcp->bufpos = tcp->buf;
+}
+
+static void collect_header(lua_State *l, ls_tcp_t *tcp)
+{
+    ls_getref(l, tcp->dataref);
+    luaL_getsubtable(l, -1, "headers");
+    lua_pushstring(l, tcp->header_key);
+    lua_pushlstring(l, tcp->header_value, tcp->bufpos - tcp->header_value);
+    lua_settable(l, -3);
+    lua_pop(l, 2) /*pop up request/response and headers */
+    tcp->header_key = NULL;
+    tcp->header_value = NULL;
+    tcp->bufpos = tcp->buf;
+}
+
+static int on_header_field(http_parser *parser, const char *data, size_t len)
+{
+    lua_State *l = ls_default_state();
+    ls_http_t *tcp = containerof(parser, ls_http_t, httpparser);
+
+    if (tcp->url)
+    {
+        /* just finish collecting url */
+        collect_url(l, tcp);
+        tcp->header_key = tcp->buf;
+    }
+
+    if (tcp->header_value && tcp->header_key)
+    {
+        /* just finish collecting former header */
+        collect_header(l, tcp);
+        tcp->header_key = tcp->buf;
+    }
+
+    if (tcp->bufpos + len - tcp->buf >= arraysize(tcp->buf))
+    {
+        luaL_error(l, "too long field name");
+    }
+
+    memcpy(tcp->bufpos, data, len);
+    tcp->bufpos += len;
+
+    return 0;
+}
+
+static int on_header_value(http_parser *parser, const char *data, size_t len)
+{
+    lua_State *l = ls_default_state();
+    ls_http_t *tcp = containerof(parser, ls_http_t, httpparser);
+
+    if (tcp->header_value == NULL)
+    {
+        /* just finish collecting the field name */
+        *tcp->bufpos++ = '\0'; 
+        tcp->header_value = tcp->bufpos;
+    }
+    
+    if (tcp->bufpos + len - tcp->buf >= arraysize(tcp->buf))
+    {
+        luaL_error(l, "too long field name");
+    }
+
+    memcpy(tcp->bufpos, data, len);
+    tcp->bufpos += len;
+
+    return 0;
+}
+
+static int on_headers_complete(http_parser *parser)
+{
+    lua_State *l = ls_default_state();
+    ls_http_t *tcp = containerof(parser, ls_http_t, httpparser);
+
+    if (tcp->url)
+    {
+        /* when no headers. can this happen??? */
+        collect_url(l, tcp);
+    }
+
+    if (tcp->header_key && tcp->header_value)
+    {
+        collect_header(l, tcp);
+    }
+
+    ls_getref(l, tcp->dataref);
+    lua_pushinteger(l, parser->http_major);
+    lua_setfield(l, -2, "http_major");
+    lua_pushinteger(l, parser->http_minor);
+    lua_setfield(l, -2, "http_minor");
+    /* for response */
+    lua_pushinteger(l, parser->status_code);
+    lua_setfield(l, -2, "status_code");
+    /* for request */
+    lua_pushstring(l, http_method_str(parser->method));
+    lua_setfield(l, -2, "method");
+
+
+    return 0;
+}
+
+static int on_body(http_parser *parser, const char *data, size_t len)
+{
+    (void)parser;
+    fp1("on_body", len);
+    write(1, data, len);
+    fp0("\n");
+    return 0;
+}
+
+static int on_message_complete(http_parser *parser)
+{
+    (void)parser;
+    fp0("on_message_complete\n");
+    return 0;
+}
+
+static http_parser_settings httpparsersettings = {
+    .on_message_begin = on_message_begin,
+    .on_url = on_url,
+    .on_header_field = on_header_field,
+    .on_header_value = on_header_value,
+    .on_headers_complete = on_headers_complete,
+    .on_body = on_body,
+    .on_message_complete = on_message_complete
+};
+
+static ls_tcp_t *new_tcp_handle(lua_State *l, int httptype)
+{
+    ls_tcp_t *tcp = (ls_tcp_t*)ls_malloc(l, sizeof(ls_tcp_t));
+
+    uv_tcp_init(uv_default_loop(), &tcp->handle);
+
+    ls_mthread_ref_init(&tcp->mthread_ref0, 0);
+
+    ngx_queue_init(&tcp->mthread_queue);
+
+    http_parser_init(&tcp->http_parser, httptype);
+    tcp->bufpos = tcp->buf;
+    tcp->header_value = NULL;
+    tcp->dataref = LUA_NOREF;
+
+    return tcp;
+}
+
+
+static void tcp_read_cb(uv_stream_t *handle, ssize_t nread, uv_buf_t buf)
+{
+    lua_State *l    = ls_default_state();
+    ls_tcp_t  *tcp  = (ls_tcp_t*)handle;
+
+    if (ngx_queue_empty(&tcp->mthread_queue))
+        return;
+
+    if (nread < 0)
+    {
+    }
+
+    size_t n = http_parser_execute(&tcp->httpparser, &httpparsersettings, buf.base, nread);
+    if (n < nread)
+    {
+        luaL_error(l, "error parse http header.");
+    }
+
+
+    while (nl = ls_mthread_dequeue(l, &tcp->mthread_queue))
+    {
+        ls_timer_stop(nl, 1);
+
+        if (LUA_YIELD != lua_status(nl))
+        {
+            lua_pop(nl, 1);
+            continue;
+        }
+
+        if (nread == -1)
+            ls_last_error_resume(nl, loop);
+        else
+        {
+            /*
+            lua_pushboolean(nl, 1);
+            lua_pushlstring(nl, buf.base, nread);
+            ls_resume(nl, 2);
+            */
+        }
+
+        // pop the thread after resume, to ensure the thread is not released by GC.
+        if (nl != l)
+            lua_pop(l, 1);
+        return;
+    }
+}
+
+
+static const luaL_Reg tcp_lib[] = {
+    {"createServer", tcp_create_server},
+    {"createClient", tcp_create_client},
+    {NULL, NULL}
+};
+
+static const luaL_Reg tcp_server_lib[] = {
+    {"accept", tcp_server_accept},
+    {"close", tcp_server_close},
+    {"getLocalIP", tcp_server_get_localip},
+    {"getLocalPort", tcp_server_get_localport},
+    {"__gc", tcp_server_gc},
+    {"__tostring", tcp_server_tostring},
+    {NULL, NULL}
+};
+
+static const luaL_Reg tcp_connection_lib[] = {
+    {"read", tcp_read},
+    {"write", tcp_write},
+    {"close", tcp_close},
+    {"getTimeout", tcp_get_timeout},
+    {"setTimeout", tcp_set_timeout},
+    {"keepalive", tcp_keepalive},
+    {"nodelay", tcp_nodelay},
+    {"getLocalIP", tcp_get_localip},
+    {"getLocalPort", tcp_get_localport},
+    {"getPeerIP", tcp_get_peerip},
+    {"getPeerPort", tcp_get_peerport},
+    {"__gc", tcp_gc},
+    {"__tostring", tcp_tostring},
+    {NULL, NULL}
+};
+
+LUAMOD_API int luaopen_tcp(lua_State *l)
+{
+    luaL_newlib(l, tcp_lib);
+    lua_pushinteger(l, 30*1000);
+    lua_setfield(l, -2, "connect_timeout");
+
+    ls_create_metatable(l, TCP_SERVER, tcp_server_lib);
+    ls_create_metatable(l, TCP_CONNECTION, tcp_connection_lib);
+
+    return 1;
+}
+

@@ -1,6 +1,7 @@
 #include "lserver.h"
 #include <string.h>
 #include <assert.h>
+#include "ls-tcp.h"
 
 #define TCP_SERVER         "ls_tcp_server"
 #define TCP_CONNECTION     "ls_tcp_connection"
@@ -28,13 +29,6 @@ static ls_write_t *new_write_req(lua_State *l)
     return wr;
 }
 
-/* object in C */
-typedef struct ls_tcp_s
-{
-    ls_wait_object_t wait_object;
-    uv_tcp_t         handle;
-    uv_read_cb       read_cb;
-} ls_tcp_t;
 
 /* object seen in lua */
 typedef struct tcp_udata_s
@@ -53,7 +47,6 @@ static ls_tcp_t *new_tcp_handle(lua_State *l)
 
     ls_wait_object_init(&tcp->wait_object);
     uv_tcp_init(uv_default_loop(), &tcp->handle);
-    tcp->read_cb = tcp_read_cb;
 
     return tcp;
 }
@@ -180,7 +173,7 @@ static void tcp_listen_cb(uv_stream_t *handle, int status)
                     ls_free(nl, client);
                     luaL_error(nl, "accept failed");
                 }
-                if (uv_read_start((uv_stream_t*)&client->handle, tcp_alloc_cb, client->read_cb))
+                if (uv_read_start((uv_stream_t*)&client->handle, tcp_alloc_cb, tcp_read_cb))
                 {
                     ls_free(nl, client);
                     luaL_error(nl, "start read failed.");
@@ -270,7 +263,7 @@ static void tcp_connect_cb(uv_connect_t *connect_req, int status)
             }
             else
             {
-                if (uv_read_start((uv_stream_t*)handle, tcp_alloc_cb, client->read_cb))
+                if (uv_read_start((uv_stream_t*)handle, tcp_alloc_cb, tcp_read_cb))
                 {
                     uv_close((uv_handle_t*)handle, tcp_close_cb);
                     ls_last_error_resume(nl, loop);
