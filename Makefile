@@ -1,7 +1,15 @@
+uname = $(shell uname)
 ls_srcs = $(shell find src -name "*.c")
 ls_objs = $(ls_srcs:.c=.o)
 ls_cflags = -Isrc -Ilib/lua-5.2.1/src -Ilib/libuv-node-v0.9.7/include
+
+ifeq ($(uname), Linux)
 ls_ldflags = -lpthread -lrt -lm -ldl
+endif
+
+ifeq ($(uname), Darwin)
+ls_ldflags = -framework CoreServices
+endif
 
 liblua = lib/lua-5.2.1/src/liblua.a
 libuv =  lib/libuv-node-v0.9.7/libuv.a
@@ -25,14 +33,14 @@ $(liblua):
 $(libuv):
 	$(MAKE) -C lib/libuv-node-v0.9.7
 
-ts:
+ts: lserver
 	./lserver test/simple-server.lua
 
-tc:
+tc: lserver
 	./lserver test/simple-client.lua
 
-d:
-	gdb lserver
+d: lserver
+	gdb lse rver
 
 tag:
 	find . -name "*.h" -o -name "*.c" | xargs ctags
